@@ -1,0 +1,394 @@
+name: Build Flutter
+run-name: Build ${{ inputs.tag }} (${{ inputs.build_type }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag yang berisi source ZIP
+        required: true
+      build_type:
+        description: release atau debug
+        default: release
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.pub-cache
+          key: gradle-pub-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            gradle-pub-${{ runner.os }}-
+
+      - name: Download & extract source ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p source
+          gh release download "${{ inputs.tag }}" --repo ${{ github.repository }} --pattern "*.zip" --dir source
+          cd source
+          unzip -q -o ./source.zip || unzip -q -o ./*.zip
+          PUB=$(find . -name pubspec.yaml -not -path '*/__MACOSX/*' -not -path '*/.dart_tool/*' -not -path '*/ephemeral/*' -not -path '*/example/*' -not -path '*/.symlinks/*' | awk '{print length, $0}' | sort -n | sed -n '1p' | cut -d' ' -f2- || true)
+          if [ -z "$PUB" ]; then
+            echo "Isi ZIP (3 level teratas):"
+            find . -maxdepth 3 | head -60 || true
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Zip folder project Flutter yang ada pubspec.yaml."
+            exit 1
+          fi
+          ROOT=$(cd "$(dirname "$PUB")" && pwd)
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
+
+      - name: Auto-fix minSdk (minimal 24)
+        run: |
+          cd "$PROJECT_ROOT"
+          cat > /tmp/fixminsdk.py <<'PY'
+          import re, glob, os
+          t = int(os.environ['MS'])
+          files = glob.glob('android/app/build.gradle') + glob.glob('android/app/build.gradle.kts')
+          rx = re.compile(r'(minSdk(?:Version)?)(\s*=?\s*)(\d+|flutter\.minSdkVersion)')
+          def fix(m):
+              v = m.group(3)
+              if v.isdigit() and int(v) >= t:
+                  return m.group(0)
+              return m.group(1) + m.group(2) + str(t)
+          for f in files:
+              src = open(f, encoding='utf-8').read()
+              out = rx.sub(fix, src)
+              if out != src:
+                  open(f, 'w', encoding='utf-8').write(out)
+                  print('minSdk dinaikkan ke', t, 'di', f)
+          PY
+          MS=24 python3 /tmp/fixminsdk.py
+
+
+      - name: Deteksi Gradle/AGP project
+        run: |
+          cd "$PROJECT_ROOT"
+          GV=$(grep -o 'gradle-[0-9]*' android/gradle/wrapper/gradle-wrapper.properties 2>/dev/null | head -1 | grep -o '[0-9]*$' || true)
+          AV=$(cat android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts 2>/dev/null | grep -oE 'com[.]android[.](application|tools[.]build:gradle)[^0-9]{0,40}[0-9]+' | head -1 | grep -oE '[0-9]+$' || true)
+          echo "Gradle major: ${GV:-?}, AGP major: ${AV:-?}"
+          if [ "${GV:-0}" -ge 9 ] || [ "${AV:-0}" -ge 9 ]; then
+            echo "PREFER_LATEST=1" >> "$GITHUB_ENV"
+            echo "::notice::Project Gradle/AGP 9+, mulai dari Flutter terbaru"
+          fi
+
+      - name: Optimasi Gradle
+        run: |
+          AV=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          if [ "${AV:-99}" -lt 8 ]; then sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost; fi
+          mkdir -p ~/.gradle
+          {
+            echo 'org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g'
+            echo 'org.gradle.parallel=true'
+            echo 'org.gradle.caching=true'
+            echo 'org.gradle.configureondemand=true'
+          } >> ~/.gradle/gradle.properties
+
+      - name: Setup Flutter terbaru (prioritas)
+        if: env.BUILD_DONE != '1' && env.PREFER_LATEST == '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ''
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter terbaru (prioritas)
+        if: env.BUILD_DONE != '1' && env.PREFER_LATEST == '1'
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          flutter --version
+          LOG=/tmp/build-a.log
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --no-shrink"
+          fi
+          flutter pub get 2>&1 | tee $LOG
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter terbaru (prioritas)"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter terbaru (prioritas), mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.38.x
+        if: env.BUILD_DONE != '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.38.x
+        if: env.BUILD_DONE != '1'
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          flutter --version
+          LOG=/tmp/build-0.log
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --no-shrink"
+          fi
+          flutter pub get 2>&1 | tee $LOG
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.38.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.38.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.35.x
+        if: env.BUILD_DONE != '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.35.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.35.x
+        if: env.BUILD_DONE != '1'
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          flutter --version
+          LOG=/tmp/build-1.log
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --no-shrink"
+          fi
+          flutter pub get 2>&1 | tee $LOG
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.35.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.35.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.32.x
+        if: env.BUILD_DONE != '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.32.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.32.x
+        if: env.BUILD_DONE != '1'
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          flutter --version
+          LOG=/tmp/build-2.log
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --no-shrink"
+          fi
+          flutter pub get 2>&1 | tee $LOG
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.32.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.32.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.29.x
+        if: env.BUILD_DONE != '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.29.x
+        if: env.BUILD_DONE != '1'
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          flutter --version
+          LOG=/tmp/build-3.log
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --no-shrink"
+          fi
+          flutter pub get 2>&1 | tee $LOG
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.29.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.29.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter terbaru (terakhir)
+        if: env.BUILD_DONE != '1' && env.PREFER_LATEST != '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ''
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter terbaru (terakhir)
+        if: env.BUILD_DONE != '1' && env.PREFER_LATEST != '1'
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          flutter --version
+          LOG=/tmp/build-z.log
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --no-shrink"
+          fi
+          flutter pub get 2>&1 | tee $LOG
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build apk $ARGS 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+              M=$(grep -o "cannot be smaller than version [0-9]*" $LOG | head -1 | grep -o '[0-9]*$')
+              [ -z "$M" ] && break
+              echo "::notice::minSdk dinaikkan ke $M lalu build diulang"
+              MS=$M python3 /tmp/fixminsdk.py
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter terbaru (terakhir)"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter terbaru (terakhir), mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Cek hasil build
+        if: env.BUILD_OK != '1'
+        run: |
+          echo "::error::Build gagal. Versi Flutter yang dicoba: 3.38.x, 3.35.x, 3.32.x, 3.29.x, terbaru"
+          for f in /tmp/build-*.log; do
+            echo "=== $f ==="
+            grep -iE 'error|failed|went wrong|minimum|cannot be smaller' "$f" | tail -30 || true
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ inputs.build_type }}
+          path: ${{ env.PROJECT_ROOT }}/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
