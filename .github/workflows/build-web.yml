@@ -1,0 +1,307 @@
+name: Build Flutter Web
+run-name: Build ${{ inputs.tag }} (web)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag yang berisi source ZIP
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.pub-cache
+          key: gradle-pub-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            gradle-pub-${{ runner.os }}-
+
+      - name: Download & extract source ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p source
+          gh release download "${{ inputs.tag }}" --repo ${{ github.repository }} --pattern "*.zip" --dir source
+          cd source
+          unzip -q -o ./source.zip || unzip -q -o ./*.zip
+          PUB=$(find . -name pubspec.yaml -not -path '*/__MACOSX/*' -not -path '*/.dart_tool/*' -not -path '*/ephemeral/*' -not -path '*/example/*' -not -path '*/.symlinks/*' | awk '{print length, $0}' | sort -n | sed -n '1p' | cut -d' ' -f2- || true)
+          if [ -z "$PUB" ]; then
+            echo "Isi ZIP (3 level teratas):"
+            find . -maxdepth 3 | head -60 || true
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Zip folder project Flutter yang ada pubspec.yaml."
+            exit 1
+          fi
+          ROOT=$(cd "$(dirname "$PUB")" && pwd)
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
+
+
+      - name: Prioritas Flutter terbaru (web)
+        run: echo "PREFER_LATEST=1" >> "$GITHUB_ENV"
+
+      - name: Optimasi Gradle
+        run: |
+          AV=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          if [ "${AV:-99}" -lt 8 ]; then sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost; fi
+          mkdir -p ~/.gradle
+          {
+            echo 'org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g'
+            echo 'org.gradle.parallel=true'
+            echo 'org.gradle.caching=true'
+            echo 'org.gradle.configureondemand=true'
+          } >> ~/.gradle/gradle.properties
+
+      - name: Setup Flutter terbaru (prioritas)
+        if: env.BUILD_DONE != '1' && env.PREFER_LATEST == '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ''
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter terbaru (prioritas)
+        if: env.BUILD_DONE != '1' && env.PREFER_LATEST == '1'
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          flutter --version
+          LOG=/tmp/build-a.log
+          flutter pub get 2>&1 | tee $LOG
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build web --release 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter terbaru (prioritas)"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter terbaru (prioritas), mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.38.x
+        if: env.BUILD_DONE != '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.38.x
+        if: env.BUILD_DONE != '1'
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          flutter --version
+          LOG=/tmp/build-0.log
+          flutter pub get 2>&1 | tee $LOG
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build web --release 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.38.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.38.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.35.x
+        if: env.BUILD_DONE != '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.35.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.35.x
+        if: env.BUILD_DONE != '1'
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          flutter --version
+          LOG=/tmp/build-1.log
+          flutter pub get 2>&1 | tee $LOG
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build web --release 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.35.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.35.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.32.x
+        if: env.BUILD_DONE != '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.32.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.32.x
+        if: env.BUILD_DONE != '1'
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          flutter --version
+          LOG=/tmp/build-2.log
+          flutter pub get 2>&1 | tee $LOG
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build web --release 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.32.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.32.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter 3.29.x
+        if: env.BUILD_DONE != '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.x'
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter 3.29.x
+        if: env.BUILD_DONE != '1'
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          flutter --version
+          LOG=/tmp/build-3.log
+          flutter pub get 2>&1 | tee $LOG
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build web --release 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter 3.29.x"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter 3.29.x, mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Setup Flutter terbaru (terakhir)
+        if: env.BUILD_DONE != '1' && env.PREFER_LATEST != '1'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ''
+          channel: stable
+          cache: true
+
+      - name: Build dengan Flutter terbaru (terakhir)
+        if: env.BUILD_DONE != '1' && env.PREFER_LATEST != '1'
+        run: |
+          cd "$PROJECT_ROOT"
+          set +e
+          rm -rf .dart_tool build
+          flutter --version
+          LOG=/tmp/build-z.log
+          flutter pub get 2>&1 | tee $LOG
+          RC=${PIPESTATUS[0]}
+          if [ "$RC" -eq 0 ]; then
+            for n in 1 2 3 4 5; do
+              flutter build web --release 2>&1 | tee $LOG
+              RC=${PIPESTATUS[0]}
+              [ "$RC" -eq 0 ] && break
+            done
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "BUILD_OK=1" >> "$GITHUB_ENV"
+            echo "::notice::Build sukses dengan Flutter terbaru (terakhir)"
+          elif ! grep -Eiq 'minimum supported version|No named parameter|isn.t defined|is not defined|Undefined (name|class|method)|The (getter|method|named parameter)|Dart SDK|SDK version|version solving|requires Flutter|Unsupported (class file|Gradle|Kotlin)|Android Gradle Plugin|incompatible|Kotlin.*version|NoSuchMethod|compileSdk' $LOG; then
+            echo "BUILD_DONE=1" >> "$GITHUB_ENV"
+            echo "Error bukan masalah versi Flutter, tidak mencoba versi lain."
+          else
+            echo "::warning::Gagal di Flutter terbaru (terakhir), mencoba versi lain..."
+          fi
+          exit 0
+
+      - name: Cek hasil build
+        if: env.BUILD_OK != '1'
+        run: |
+          echo "::error::Build gagal. Versi Flutter yang dicoba: 3.38.x, 3.35.x, 3.32.x, 3.29.x, terbaru"
+          for f in /tmp/build-*.log; do
+            echo "=== $f ==="
+            grep -iE 'error|failed|went wrong|minimum|cannot be smaller' "$f" | tail -30 || true
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: ${{ env.PROJECT_ROOT }}/build/web
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
